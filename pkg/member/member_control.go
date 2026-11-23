@@ -25,6 +25,7 @@ import (
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	v1 "k8s.io/api/coordination/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -43,6 +44,9 @@ const (
 var (
 	// ErrMissingMember is a sentient error to describe a case of a member being missing from the member list
 	ErrMissingMember = errors.New("member missing from member list")
+
+	// clientServiceSelectorLabelKeys are the keys of the pod labels by which etcd-druid's client service selects the etcd members.
+	clientServiceSelectorLabelKeys = []string{"app.kubernetes.io/managed-by", "app.kubernetes.io/part-of", "app.kubernetes.io/component"}
 )
 
 // Control interface defines the functionalities needed to manipulate a member in the etcd cluster
@@ -58,6 +62,12 @@ type Control interface {
 
 	// WasMemberInCluster checks whether current members was part of the etcd cluster or not.
 	WasMemberInCluster(context.Context, client.Client) bool
+
+	// HasMemberLeaseHolder checks whether the member lease names a holder, which the member's heartbeat sets once its etcd runs in the cluster.
+	HasMemberLeaseHolder(context.Context, client.Client) bool
+
+	// NoMemberReady checks whether no etcd member is ready behind the client service, so that every call through it can only time out.
+	NoMemberReady(context.Context) (bool, error)
 
 	// WasPermanentlyRemoved reports whether this member was explicitly removed
 	// from the cluster during a prior scale-in. Returns ErrMembershipCheckFailed
@@ -86,12 +96,13 @@ type Control interface {
 
 // memberControl holds the configuration for the mechanism of adding a new member to the cluster.
 type memberControl struct {
-	clientFactory etcdClient.Factory
-	logger        logrus.Entry
-	podName       string
-	memberName    string
-	configFile    string
-	podNamespace  string
+	clientFactory     etcdClient.Factory
+	logger            logrus.Entry
+	podName           string
+	memberName        string
+	configFile        string
+	podNamespace      string
+	usesClientService bool
 }
 
 // NewMemberControl returns new ExponentialBackoff.
@@ -122,11 +133,13 @@ func NewMemberControl(etcdConnConfig *brtypes.EtcdConnectionConfig) Control {
 	memberName := miscellaneous.ComputeMemberName(memberNamePrefix, podName)
 
 	return &memberControl{
-		clientFactory: clientFactory,
-		logger:        *logger,
-		memberName:    memberName,
-		configFile:    configFile,
-		podNamespace:  podNamespace,
+		clientFactory:     clientFactory,
+		logger:            *logger,
+		podName:           podName,
+		memberName:        memberName,
+		configFile:        configFile,
+		podNamespace:      podNamespace,
+		usesClientService: len(etcdConn.ServiceEndpoints) > 0 && !miscellaneous.EndpointsFileConfigured(),
 	}
 }
 
@@ -406,6 +419,11 @@ func (m *memberControl) WasMemberInCluster(ctx context.Context, clientSet client
 	}
 	m.logger.Errorf("unable to check member presence via api call: %v", err)
 
+	return m.HasMemberLeaseHolder(ctx, clientSet)
+}
+
+// HasMemberLeaseHolder checks whether the member lease names a holder, which the member's heartbeat sets once its etcd runs in the cluster.
+func (m *memberControl) HasMemberLeaseHolder(ctx context.Context, clientSet client.Client) bool {
 	m.logger.Info("fetching the member lease associated with etcd member")
 	memberLease := &v1.Lease{}
 	if err := clientSet.Get(ctx, client.ObjectKey{
@@ -417,6 +435,57 @@ func (m *memberControl) WasMemberInCluster(ctx context.Context, clientSet client
 	}
 
 	return memberLease.Spec.HolderIdentity != nil
+}
+
+// NoMemberReady checks whether no etcd member is ready behind the client service, so that every call through it can only time out.
+// It returns false when the cluster is reached without the client service, through the endpoints file or the members' client URLs.
+func (m *memberControl) NoMemberReady(ctx context.Context) (bool, error) {
+	if !m.usesClientService {
+		return false, nil
+	}
+	clientSet, err := miscellaneous.GetKubernetesClientSetOrError()
+	if err != nil {
+		return false, fmt.Errorf("failed to create clientset: %w", err)
+	}
+	ready, err := IsAnyMemberReady(ctx, clientSet, m.podNamespace, m.podName)
+	if err != nil {
+		return false, err
+	}
+	return !ready, nil
+}
+
+// IsAnyMemberReady checks whether a pod behind the etcd client service is ready. It selects the pods by the labels the
+// service selects on, read from the pod podName, and skips terminating pods, which are no endpoints of the service.
+func IsAnyMemberReady(ctx context.Context, k8sClient client.Client, podNamespace, podName string) (bool, error) {
+	pod := &corev1.Pod{}
+	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: podNamespace, Name: podName}, pod); err != nil {
+		return false, fmt.Errorf("unable to fetch pod %s: %w", podName, err)
+	}
+
+	selector := client.MatchingLabels{}
+	for _, key := range clientServiceSelectorLabelKeys {
+		value, ok := pod.Labels[key]
+		if !ok {
+			return false, fmt.Errorf("pod %s has no label %s to select the etcd members by", podName, key)
+		}
+		selector[key] = value
+	}
+
+	pods := &corev1.PodList{}
+	if err := k8sClient.List(ctx, pods, client.InNamespace(podNamespace), selector); err != nil {
+		return false, fmt.Errorf("unable to list the etcd member pods: %w", err)
+	}
+	for _, p := range pods.Items {
+		if p.DeletionTimestamp != nil {
+			continue
+		}
+		for _, condition := range p.Status.Conditions {
+			if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 // WasPermanentlyRemoved checks whether this member was permanently removed from

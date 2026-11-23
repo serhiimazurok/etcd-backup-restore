@@ -24,6 +24,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"go.uber.org/zap"
 	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
@@ -80,27 +81,18 @@ func (e *EtcdInitializer) Initialize(mode validator.Mode) error {
 			}
 		}
 
-		// check heartbeat of etcd member
-		if memberHeartbeatPresent = m.WasMemberInCluster(ctx, clientSet); memberHeartbeatPresent {
-			logger.Info("member found to be already a part of the cluster")
-			logger.Info("skipping the scale-up check")
-		} else {
-			logger.Info("member heartbeat is not present")
-			logger.Info("backup-restore will start the scale-up check")
-			isScaleup, err := m.IsClusterScaledUp(ctx)
-			if err != nil {
-				logger.Errorf("scale-up not detected: %v", err)
-			} else if isScaleup {
-				logger.Info("Etcd cluster scale-up is detected")
-				// Add a learner(non-voting member) to a etcd cluster with retry
-				// If backup-restore is unable to add a learner in a cluster
-				// restart the `initialization` by exiting the backup-restore.
-				if err := member.AddLearnerWithRetry(ctx, m, addLearnerAttempts, e.Config.RestoreOptions.Config.DataDir); err != nil {
-					logger.Fatalf("unable to add a learner in a cluster: %v", err)
-				}
-				// return here after adding learner(non-voting member) as no restoration or validation required.
-				return nil
+		var isScaleup bool
+		memberHeartbeatPresent, isScaleup = checkMembership(ctx, logger, m, clientSet)
+		if isScaleup {
+			logger.Info("Etcd cluster scale-up is detected")
+			// Add a learner(non-voting member) to a etcd cluster with retry
+			// If backup-restore is unable to add a learner in a cluster
+			// restart the `initialization` by exiting the backup-restore.
+			if err := member.AddLearnerWithRetry(ctx, m, addLearnerAttempts, e.Config.RestoreOptions.Config.DataDir); err != nil {
+				logger.Fatalf("unable to add a learner in a cluster: %v", err)
 			}
+			// return here after adding learner(non-voting member) as no restoration or validation required.
+			return nil
 		}
 	}
 
@@ -166,6 +158,37 @@ func (e *EtcdInitializer) Initialize(mode validator.Mode) error {
 	}
 
 	return nil
+}
+
+// checkMembership checks whether the member was part of the etcd cluster and, if it was not, whether the cluster is scaled up.
+func checkMembership(ctx context.Context, logger *logrus.Entry, m member.Control, clientSet client.Client) (memberHeartbeatPresent, isScaleup bool) {
+	if noMemberReady, err := m.NoMemberReady(ctx); err != nil {
+		logger.Warnf("unable to check whether an etcd member is ready, probing the cluster: %v", err)
+	} else if noMemberReady {
+		logger.Info("no etcd member is ready behind the client service, skipping the probes through it")
+		if m.HasMemberLeaseHolder(ctx, clientSet) {
+			logger.Info("member found to be already a part of the cluster")
+			return true, false
+		}
+		logger.Info("member heartbeat is not present")
+		logger.Info("skipping the scale-up check: no etcd member is ready to be joined")
+		return false, false
+	}
+
+	// check heartbeat of etcd member
+	if m.WasMemberInCluster(ctx, clientSet) {
+		logger.Info("member found to be already a part of the cluster")
+		logger.Info("skipping the scale-up check")
+		return true, false
+	}
+	logger.Info("member heartbeat is not present")
+	logger.Info("backup-restore will start the scale-up check")
+	isScaleup, err := m.IsClusterScaledUp(ctx)
+	if err != nil {
+		logger.Errorf("scale-up not detected: %v", err)
+		return false, false
+	}
+	return false, isScaleup
 }
 
 // NewInitializer creates an etcd initializer object.

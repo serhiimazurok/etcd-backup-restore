@@ -22,12 +22,20 @@ import (
 
 // fakeLearnerChecker is a test double for learnerChecker.
 type fakeLearnerChecker struct {
-	err            error
-	learnerPresent bool
+	err              error
+	noMemberReadyErr error
+	learnerPresent   bool
+	noMemberReady    bool
+	learnerChecked   bool
 }
 
 func (f *fakeLearnerChecker) IsLearnerPresent(_ context.Context) (bool, error) {
+	f.learnerChecked = true
 	return f.learnerPresent, f.err
+}
+
+func (f *fakeLearnerChecker) NoMemberReady(_ context.Context) (bool, error) {
+	return f.noMemberReady, f.noMemberReadyErr
 }
 
 // fakeMemberLister is a test double for memberLister.
@@ -185,11 +193,14 @@ func parseInitialCluster(s string) map[string]string {
 
 func TestGetClusterState(t *testing.T) {
 	tests := []struct {
-		learnerErr     error
-		name           string
-		expectedState  string
-		clusterSize    int
-		learnerPresent bool
+		learnerErr         error
+		noMemberReadyErr   error
+		name               string
+		expectedState      string
+		clusterSize        int
+		learnerPresent     bool
+		noMemberReady      bool
+		expectLearnerCheck bool
 	}{
 		{
 			name:          "single node always returns new",
@@ -197,39 +208,62 @@ func TestGetClusterState(t *testing.T) {
 			expectedState: miscellaneous.ClusterStateNew,
 		},
 		{
-			name:           "multi-node with learner present returns existing",
+			name:               "multi-node with learner present returns existing",
+			clusterSize:        3,
+			learnerPresent:     true,
+			expectedState:      miscellaneous.ClusterStateExisting,
+			expectLearnerCheck: true,
+		},
+		{
+			name:               "multi-node with no learner returns new",
+			clusterSize:        3,
+			learnerPresent:     false,
+			expectedState:      miscellaneous.ClusterStateNew,
+			expectLearnerCheck: true,
+		},
+		{
+			name:               "multi-node fresh bootstrap (0-to-3 scale-out) returns new",
+			clusterSize:        3,
+			learnerErr:         errors.New("context deadline exceeded"),
+			expectedState:      miscellaneous.ClusterStateNew,
+			expectLearnerCheck: true,
+		},
+		{
+			name:               "multi-node with IsLearnerPresent error defaults to new",
+			clusterSize:        3,
+			learnerPresent:     false,
+			learnerErr:         errors.New("etcd connection refused"),
+			expectedState:      miscellaneous.ClusterStateNew,
+			expectLearnerCheck: true,
+		},
+		{
+			name:           "multi-node with no member ready returns new without checking for a learner",
 			clusterSize:    3,
+			noMemberReady:  true,
 			learnerPresent: true,
-			expectedState:  miscellaneous.ClusterStateExisting,
-		},
-		{
-			name:           "multi-node with no learner returns new",
-			clusterSize:    3,
-			learnerPresent: false,
 			expectedState:  miscellaneous.ClusterStateNew,
 		},
 		{
-			name:          "multi-node fresh bootstrap (0-to-3 scale-out) returns new",
-			clusterSize:   3,
-			learnerErr:    errors.New("context deadline exceeded"),
-			expectedState: miscellaneous.ClusterStateNew,
-		},
-		{
-			name:           "multi-node with IsLearnerPresent error defaults to new",
-			clusterSize:    3,
-			learnerPresent: false,
-			learnerErr:     errors.New("etcd connection refused"),
-			expectedState:  miscellaneous.ClusterStateNew,
+			name:               "multi-node with member readiness unknown checks for a learner",
+			clusterSize:        3,
+			noMemberReady:      true,
+			noMemberReadyErr:   errors.New("pods is forbidden"),
+			learnerPresent:     true,
+			expectedState:      miscellaneous.ClusterStateExisting,
+			expectLearnerCheck: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := &HTTPHandler{Logger: logrus.New().WithField("suite", "cluster state")}
-			m := &fakeLearnerChecker{learnerPresent: tt.learnerPresent, err: tt.learnerErr}
+			m := &fakeLearnerChecker{learnerPresent: tt.learnerPresent, err: tt.learnerErr, noMemberReady: tt.noMemberReady, noMemberReadyErr: tt.noMemberReadyErr}
 			state := h.getClusterState(context.Background(), tt.clusterSize, m)
 			if state != tt.expectedState {
 				t.Errorf("expected state %q, got %q", tt.expectedState, state)
+			}
+			if m.learnerChecked != tt.expectLearnerCheck {
+				t.Errorf("expected learner check %v, got %v", tt.expectLearnerCheck, m.learnerChecked)
 			}
 		})
 	}

@@ -6,6 +6,7 @@ package member_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,8 +20,11 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/mock/gomock"
 	coordinationv1 "k8s.io/api/coordination/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -239,6 +243,168 @@ auto-compaction-retention: 30m` + prefixLine
 				Expect(isScaleUp).Should(BeFalse())
 				Expect(err).ShouldNot(HaveOccurred())
 			})
+		})
+	})
+
+	Describe("Checking the member lease for a holder", func() {
+		var m member.Control
+
+		newLease := func(holderIdentity *string) *coordinationv1.Lease {
+			return &coordinationv1.Lease{
+				ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: podNamespace},
+				Spec:       coordinationv1.LeaseSpec{HolderIdentity: holderIdentity},
+			}
+		}
+
+		JustBeforeEach(func() {
+			m = member.NewMemberControl(etcdConnectionConfig)
+		})
+
+		It("should return true when the lease names a holder", func() {
+			identity := "abcdef:c1c1:Member"
+			cl := fake.NewClientBuilder().WithObjects(newLease(&identity)).Build()
+			Expect(m.HasMemberLeaseHolder(testCtx, cl)).To(BeTrue())
+		})
+
+		It("should return false when the lease names no holder", func() {
+			cl := fake.NewClientBuilder().WithObjects(newLease(nil)).Build()
+			Expect(m.HasMemberLeaseHolder(testCtx, cl)).To(BeFalse())
+		})
+
+		It("should return false when the lease does not exist", func() {
+			cl := fake.NewClientBuilder().Build()
+			Expect(m.HasMemberLeaseHolder(testCtx, cl)).To(BeFalse())
+		})
+	})
+
+	Describe("Checking whether no member is ready behind the client service", func() {
+		BeforeEach(func() {
+			GinkgoT().Setenv("KUBECONFIG", "/nonexistent/kubeconfig")
+		})
+
+		It("should return false without asking Kubernetes when no service endpoints are configured", func() {
+			noMemberReady, err := member.NewMemberControl(etcdConnectionConfig).NoMemberReady(testCtx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(noMemberReady).To(BeFalse())
+		})
+
+		It("should return false without asking Kubernetes when the endpoints file is configured", func() {
+			GinkgoT().Setenv("ENDPOINTS", "/nonexistent/endpoints")
+			etcdConnectionConfig.ServiceEndpoints = []string{"http://etcd-test-client:2379"}
+			noMemberReady, err := member.NewMemberControl(etcdConnectionConfig).NoMemberReady(testCtx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(noMemberReady).To(BeFalse())
+		})
+
+		It("should ask Kubernetes when the service endpoints are configured", func() {
+			etcdConnectionConfig.ServiceEndpoints = []string{"http://etcd-test-client:2379"}
+			noMemberReady, err := member.NewMemberControl(etcdConnectionConfig).NoMemberReady(testCtx)
+			Expect(err).To(MatchError(ContainSubstring("failed to create clientset")))
+			Expect(noMemberReady).To(BeFalse())
+		})
+	})
+
+	Describe("Checking whether a member is ready behind the client service", func() {
+		memberLabels := func(etcdName string) map[string]string {
+			return map[string]string{
+				"app.kubernetes.io/managed-by": "etcd-druid",
+				"app.kubernetes.io/part-of":    etcdName,
+				"app.kubernetes.io/component":  "etcd-statefulset",
+			}
+		}
+
+		newPod := func(name string, labels map[string]string, ready bool) *corev1.Pod {
+			status := corev1.ConditionFalse
+			if ready {
+				status = corev1.ConditionTrue
+			}
+			return &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: podNamespace, Labels: labels},
+				Status: corev1.PodStatus{Conditions: []corev1.PodCondition{
+					{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
+					{Type: corev1.PodReady, Status: status},
+				}},
+			}
+		}
+
+		terminating := func(pod *corev1.Pod) *corev1.Pod {
+			now := metav1.Now()
+			pod.DeletionTimestamp = &now
+			pod.Finalizers = []string{"test"}
+			return pod
+		}
+
+		It("should return false when no member is ready", func() {
+			cl := fake.NewClientBuilder().WithObjects(
+				newPod(podName, memberLabels("etcd-test"), false),
+				newPod("etcd-test-1", memberLabels("etcd-test"), false),
+				&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "etcd-test-2", Namespace: podNamespace, Labels: memberLabels("etcd-test")}},
+			).Build()
+			ready, err := member.IsAnyMemberReady(testCtx, cl, podNamespace, podName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ready).To(BeFalse())
+		})
+
+		It("should return true when one member is ready", func() {
+			cl := fake.NewClientBuilder().WithObjects(
+				newPod(podName, memberLabels("etcd-test"), false),
+				newPod("etcd-test-1", memberLabels("etcd-test"), true),
+				newPod("etcd-test-2", memberLabels("etcd-test"), false),
+			).Build()
+			ready, err := member.IsAnyMemberReady(testCtx, cl, podNamespace, podName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ready).To(BeTrue())
+		})
+
+		It("should return false when the only ready member is terminating", func() {
+			cl := fake.NewClientBuilder().WithObjects(
+				newPod(podName, memberLabels("etcd-test"), false),
+				terminating(newPod("etcd-test-1", memberLabels("etcd-test"), true)),
+			).Build()
+			ready, err := member.IsAnyMemberReady(testCtx, cl, podNamespace, podName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ready).To(BeFalse())
+		})
+
+		It("should return false when only a member of another etcd is ready", func() {
+			cl := fake.NewClientBuilder().WithObjects(
+				newPod(podName, memberLabels("etcd-test"), false),
+				newPod("etcd-other-0", memberLabels("etcd-other"), true),
+			).Build()
+			ready, err := member.IsAnyMemberReady(testCtx, cl, podNamespace, podName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ready).To(BeFalse())
+		})
+
+		It("should return an error when the own pod lacks a label of the client service's selector", func() {
+			labels := memberLabels("etcd-test")
+			delete(labels, "app.kubernetes.io/component")
+			cl := fake.NewClientBuilder().WithObjects(
+				newPod(podName, labels, false),
+				newPod("etcd-test-1", labels, true),
+			).Build()
+			_, err := member.IsAnyMemberReady(testCtx, cl, podNamespace, podName)
+			Expect(err).To(MatchError(ContainSubstring("has no label app.kubernetes.io/component")))
+		})
+
+		It("should return an error when the own pod cannot be fetched", func() {
+			cl := fake.NewClientBuilder().WithObjects(
+				newPod("etcd-test-1", memberLabels("etcd-test"), true),
+			).Build()
+			_, err := member.IsAnyMemberReady(testCtx, cl, podNamespace, podName)
+			Expect(err).To(MatchError(ContainSubstring("unable to fetch pod")))
+		})
+
+		It("should return an error when the pods cannot be listed", func() {
+			cl := fake.NewClientBuilder().WithObjects(
+				newPod(podName, memberLabels("etcd-test"), false),
+			).WithInterceptorFuncs(interceptor.Funcs{
+				List: func(_ context.Context, _ client.WithWatch, _ client.ObjectList, _ ...client.ListOption) error {
+					return errors.New("pods is forbidden")
+				},
+			}).Build()
+			_, err := member.IsAnyMemberReady(testCtx, cl, podNamespace, podName)
+			Expect(err).To(MatchError(ContainSubstring("pods is forbidden")))
 		})
 	})
 
