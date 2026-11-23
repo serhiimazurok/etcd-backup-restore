@@ -485,6 +485,7 @@ func (h *HTTPHandler) serveConfig(rw http.ResponseWriter, req *http.Request) {
 // learnerChecker checks for learner presence in an etcd cluster.
 type learnerChecker interface {
 	IsLearnerPresent(context.Context) (bool, error)
+	NoMemberReady(context.Context) (bool, error)
 }
 
 // memberLister lists members of an etcd cluster.
@@ -501,6 +502,13 @@ func (h *HTTPHandler) getClusterState(ctx context.Context, clusterSize int, m le
 
 	// clusterSize > 1
 	// Either a multi-node bootstrap or a restoration of single member in multi-node.
+
+	if noMemberReady, err := m.NoMemberReady(ctx); err != nil {
+		h.Logger.Warnf("Unable to check whether an etcd member is ready, checking the presence of a learner: %v", err)
+	} else if noMemberReady {
+		h.Logger.Infof("No etcd member is ready to be checked for a learner. The cluster state is %v", miscellaneous.ClusterStateNew)
+		return miscellaneous.ClusterStateNew
+	}
 
 	// check whether a learner is present in the cluster.
 	// if a learner is present then return `ClusterStateExisting` because to start a learner clusterState must be 'existing'.
