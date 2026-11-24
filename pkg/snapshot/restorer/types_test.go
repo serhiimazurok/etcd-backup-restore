@@ -11,6 +11,7 @@ import (
 
 	brtypes "github.com/gardener/etcd-backup-restore/pkg/types"
 
+	flag "github.com/spf13/pflag"
 	"go.etcd.io/etcd/client/pkg/v3/types"
 
 	_ "github.com/gardener/etcd-backup-restore/pkg/snapshot/restorer"
@@ -115,6 +116,16 @@ var _ = Describe("restorer types", func() {
 				Expect(out).ToNot(BeIdenticalTo(in))
 				Expect(in).To(Equal(a))
 				Expect(in).ToNot(BeIdenticalTo(a))
+			})
+		})
+		Describe("AddFlags", func() {
+			It("should bump the revision by default and not with --bump-revision=0", func() {
+				var c, fs = brtypes.NewRestorationConfig(), flag.NewFlagSet("restore", flag.ContinueOnError)
+				c.AddFlags(fs)
+				Expect(c.RevisionBump).To(Equal(uint64(1000000000)))
+
+				Expect(fs.Parse([]string{"--bump-revision=0"})).To(Succeed())
+				Expect(c.RevisionBump).To(BeZero())
 			})
 		})
 	})

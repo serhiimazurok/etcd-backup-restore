@@ -199,6 +199,8 @@ func (r *Restorer) restoreFromBaseSnapshot(ro brtypes.RestoreOptions) error {
 		InitialClusterToken: ro.Config.InitialClusterToken,
 		OutputDataDir:       ro.Config.DataDir,
 		SkipHashCheck:       ro.Config.SkipHashCheck,
+		RevisionBump:        ro.Config.RevisionBump,
+		MarkCompacted:       ro.Config.RevisionBump > 0,
 	}
 	manager := snapshot.NewV3(r.zapLogger)
 	if err := manager.Restore(restoreCfg); err != nil {
@@ -237,13 +239,18 @@ func (r *Restorer) applyDeltaSnapshots(clientFactory client.Factory, endPoints [
 
 	firstDeltaSnap := snapList[0]
 
-	if err := r.applyFirstDeltaSnapshot(clientKV, firstDeltaSnap); err != nil {
+	revisionOffset, err := getRevisionOffset(clientKV, ro)
+	if err != nil {
+		return err
+	}
+
+	if err := r.applyFirstDeltaSnapshot(clientKV, firstDeltaSnap, revisionOffset); err != nil {
 		return err
 	}
 
 	embeddedEtcdQuotaBytes := float64(ro.Config.EmbeddedEtcdQuotaBytes)
 
-	if err := verifySnapshotRevision(clientKV, snapList[0]); err != nil {
+	if err := verifySnapshotRevision(clientKV, snapList[0], revisionOffset); err != nil {
 		return err
 	}
 
@@ -267,7 +274,7 @@ func (r *Restorer) applyDeltaSnapshots(clientFactory client.Factory, endPoints [
 		dbSizeAlarmDisarmCh = make(chan bool)
 	)
 
-	go r.applySnaps(clientKV, clientMaintenance, remainingSnaps, dbSizeAlarmCh, dbSizeAlarmDisarmCh, applierInfoCh, errCh, stopCh, &wg, endPoints, embeddedEtcdQuotaBytes)
+	go r.applySnaps(clientKV, clientMaintenance, remainingSnaps, dbSizeAlarmCh, dbSizeAlarmDisarmCh, applierInfoCh, errCh, stopCh, &wg, endPoints, embeddedEtcdQuotaBytes, revisionOffset)
 
 	for f := 0; f < numFetchers; f++ {
 		go r.fetchSnaps(f, fetcherInfoCh, applierInfoCh, snapLocationsCh, errCh, stopCh, &wg, ro.Config.TempSnapshotsDir)
@@ -369,7 +376,7 @@ func (r *Restorer) fetchSnaps(fetcherIndex int, fetcherInfoCh <-chan brtypes.Fet
 }
 
 // applySnaps applies delta snapshot events to the embedded etcd sequentially, in the right order of snapshots, regardless of the order in which they were fetched.
-func (r *Restorer) applySnaps(clientKV client.KVCloser, clientMaintenance client.MaintenanceCloser, remainingSnaps brtypes.SnapList, dbSizeAlarmCh chan string, dbSizeAlarmDisarmCh <-chan bool, applierInfoCh <-chan brtypes.ApplierInfo, errCh chan<- error, stopCh <-chan bool, wg *sync.WaitGroup, endPoints []string, embeddedEtcdQuotaBytes float64) {
+func (r *Restorer) applySnaps(clientKV client.KVCloser, clientMaintenance client.MaintenanceCloser, remainingSnaps brtypes.SnapList, dbSizeAlarmCh chan string, dbSizeAlarmDisarmCh <-chan bool, applierInfoCh <-chan brtypes.ApplierInfo, errCh chan<- error, stopCh <-chan bool, wg *sync.WaitGroup, endPoints []string, embeddedEtcdQuotaBytes float64, revisionOffset int64) {
 	defer wg.Done()
 	wg.Add(1)
 
@@ -426,7 +433,7 @@ func (r *Restorer) applySnaps(clientKV client.KVCloser, clientMaintenance client
 					}
 
 					r.logger.Infof("Applying delta snapshot %s [%d/%d]", path.Join(remainingSnaps[currSnapIndex].SnapDir, remainingSnaps[currSnapIndex].SnapName), currSnapIndex+2, len(remainingSnaps)+1)
-					if err := applyEventsAndVerify(clientKV, events, remainingSnaps[currSnapIndex]); err != nil {
+					if err := applyEventsAndVerify(clientKV, events, remainingSnaps[currSnapIndex], revisionOffset); err != nil {
 						errCh <- err
 						return
 					}
@@ -446,7 +453,7 @@ func (r *Restorer) applySnaps(clientKV client.KVCloser, clientMaintenance client
 
 					if numberOfDeltaSnapApplied%periodicallyMakeEtcdLeanDeltaSnapshotInterval == 0 || prevAttemptToMakeEtcdLeanFailed {
 						r.logger.Info("making an embedded etcd lean and check for db size alarm")
-						if err := r.MakeEtcdLeanAndCheckAlarm(int64(remainingSnaps[currSnapIndex].LastRevision), endPoints, embeddedEtcdQuotaBytes, dbSizeAlarmCh, dbSizeAlarmDisarmCh, clientKV, clientMaintenance); err != nil {
+						if err := r.MakeEtcdLeanAndCheckAlarm(int64(remainingSnaps[currSnapIndex].LastRevision)+revisionOffset, endPoints, embeddedEtcdQuotaBytes, dbSizeAlarmCh, dbSizeAlarmDisarmCh, clientKV, clientMaintenance); err != nil {
 							r.logger.Errorf("unable to make embedded etcd lean: %v", err)
 							r.logger.Warn("etcd mvcc: database space might exceeds its quota limit")
 							r.logger.Info("backup-restore will try again in next attempt...")
@@ -465,19 +472,19 @@ func (r *Restorer) applySnaps(clientKV client.KVCloser, clientMaintenance client
 }
 
 // applyEventsAndVerify applies events from one snapshot to the embedded etcd and verifies the correctness of the sequence of snapshot applied.
-func applyEventsAndVerify(clientKV client.KVCloser, events []brtypes.Event, snap *brtypes.Snapshot) error {
+func applyEventsAndVerify(clientKV client.KVCloser, events []brtypes.Event, snap *brtypes.Snapshot, revisionOffset int64) error {
 	if err := applyEventsToEtcd(clientKV, events); err != nil {
 		return fmt.Errorf("failed to apply events to etcd for delta snapshot %s : %v", snap.SnapName, err)
 	}
 
-	if err := verifySnapshotRevision(clientKV, snap); err != nil {
+	if err := verifySnapshotRevision(clientKV, snap, revisionOffset); err != nil {
 		return fmt.Errorf("snapshot revision verification failed for delta snapshot %s : %v", snap.SnapName, err)
 	}
 	return nil
 }
 
 // applyFirstDeltaSnapshot applies the events from first delta snapshot to etcd.
-func (r *Restorer) applyFirstDeltaSnapshot(clientKV client.KVCloser, snap *brtypes.Snapshot) error {
+func (r *Restorer) applyFirstDeltaSnapshot(clientKV client.KVCloser, snap *brtypes.Snapshot, revisionOffset int64) error {
 	r.logger.Infof("Applying first delta snapshot %s", path.Join(snap.SnapDir, snap.SnapName))
 
 	rc, err := r.store.Fetch(*snap)
@@ -506,7 +513,7 @@ func (r *Restorer) applyFirstDeltaSnapshot(clientKV client.KVCloser, snap *brtyp
 	if err != nil {
 		return fmt.Errorf("failed to get etcd latest revision: %v", err)
 	}
-	lastRevision := resp.Header.Revision
+	lastRevision := resp.Header.Revision - revisionOffset
 
 	if lastRevision == snap.LastRevision {
 		// there is no need to apply this fist delta snapshot
@@ -580,17 +587,35 @@ func applyEventsToEtcd(clientKV client.KVCloser, events []brtypes.Event) error {
 	return err
 }
 
-func verifySnapshotRevision(clientKV client.KVCloser, snap *brtypes.Snapshot) error {
+func verifySnapshotRevision(clientKV client.KVCloser, snap *brtypes.Snapshot, revisionOffset int64) error {
 	ctx := context.TODO()
 	getResponse, err := clientKV.Get(ctx, "foo")
 	if err != nil {
 		return fmt.Errorf("failed to connect to etcd KV client: %v", err)
 	}
 	etcdRevision := getResponse.Header.GetRevision()
-	if snap.LastRevision != etcdRevision {
-		return fmt.Errorf("mismatched event revision while applying delta snapshot, expected %d but applied %d ", snap.LastRevision, etcdRevision)
+	if snap.LastRevision+revisionOffset != etcdRevision {
+		return fmt.Errorf("mismatched event revision while applying delta snapshot, expected %d but applied %d ", snap.LastRevision+revisionOffset, etcdRevision)
 	}
 	return nil
+}
+
+// getRevisionOffset returns how far the embedded etcd's revisions are ahead of the snapshots' after the base snapshot was restored with a revision bump.
+func getRevisionOffset(clientKV client.KVCloser, ro brtypes.RestoreOptions) (int64, error) {
+	if ro.Config.RevisionBump == 0 {
+		return 0, nil
+	}
+	ctx, cancel := context.WithTimeout(context.TODO(), etcdConnectionTimeout)
+	defer cancel()
+	resp, err := clientKV.Get(ctx, "", clientv3.WithLastRev()...)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get etcd latest revision: %v", err)
+	}
+	// etcd bumps the highest key revision in the snapshot. That is below the snapshot's revision when no key
+	// is left at it, as in an empty etcd's snapshot or one an etcd before v3.5.16 compacted at a delete;
+	// the snapshot's name holds its revision then.
+	baseRevision := max(resp.Header.Revision-int64(ro.Config.RevisionBump), ro.BaseSnapshot.LastRevision) // #nosec G115 -- validated to be at most math.MaxInt64.
+	return resp.Header.Revision - baseRevision, nil
 }
 
 // getNormalizedSnapshotReadCloser passes the given ReadCloser through the

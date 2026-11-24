@@ -6,6 +6,7 @@ package types
 
 import (
 	"fmt"
+	"math"
 	"net/url"
 	"path"
 	"time"
@@ -28,6 +29,7 @@ const (
 	defaultEmbeddedEtcdQuotaBytes   = 8 * 1024 * 1024 * 1024 //8Gib
 	defaultAutoCompactionMode       = "periodic"             // only 2 mode is supported: 'periodic' or 'revision'
 	defaultAutoCompactionRetention  = "30m"
+	defaultRevisionBump             = 1000000000
 )
 
 // NewClientFactoryFunc allows to define how to create a client.Factory
@@ -64,6 +66,7 @@ type RestorationConfig struct {
 	EmbeddedEtcdQuotaBytes   int64    `json:"embeddedEtcdQuotaBytes,omitempty"`
 	MaxFetchers              uint     `json:"maxFetchers,omitempty"`
 	SkipHashCheck            bool     `json:"skipHashCheck,omitempty"`
+	RevisionBump             uint64   `json:"revisionBump,omitempty"`
 }
 
 // NewRestorationConfig returns the restoration config.
@@ -83,6 +86,7 @@ func NewRestorationConfig() *RestorationConfig {
 		EmbeddedEtcdQuotaBytes:   int64(defaultEmbeddedEtcdQuotaBytes),
 		AutoCompactionMode:       defaultAutoCompactionMode,
 		AutoCompactionRetention:  defaultAutoCompactionRetention,
+		RevisionBump:             defaultRevisionBump,
 	}
 }
 
@@ -102,6 +106,7 @@ func (c *RestorationConfig) AddFlags(fs *flag.FlagSet) {
 	fs.Int64Var(&c.EmbeddedEtcdQuotaBytes, "embedded-etcd-quota-bytes", c.EmbeddedEtcdQuotaBytes, "maximum backend quota for the embedded etcd used for applying delta snapshots")
 	fs.StringVar(&c.AutoCompactionMode, "auto-compaction-mode", c.AutoCompactionMode, "mode for auto-compaction: 'periodic' for duration based retention. 'revision' for revision number based retention.")
 	fs.StringVar(&c.AutoCompactionRetention, "auto-compaction-retention", c.AutoCompactionRetention, "Auto-compaction retention length.")
+	fs.Uint64Var(&c.RevisionBump, "bump-revision", c.RevisionBump, "how much to increase the latest revision after restore, marking it compacted so that clients watching etcd list again; 0 disables it")
 }
 
 // Validate validates the config.
@@ -123,6 +128,9 @@ func (c *RestorationConfig) Validate() error {
 	}
 	if c.AutoCompactionMode != "periodic" && c.AutoCompactionMode != "revision" {
 		return fmt.Errorf("UnSupported auto-compaction-mode")
+	}
+	if c.RevisionBump > math.MaxInt64 {
+		return fmt.Errorf("revision bump must not exceed %d", int64(math.MaxInt64))
 	}
 	c.DataDir = path.Clean(c.DataDir)
 	c.TempSnapshotsDir = path.Clean(c.TempSnapshotsDir)

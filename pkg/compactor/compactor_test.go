@@ -273,6 +273,31 @@ var _ = Describe("Running Compactor", func() {
 				Expect(err).ShouldNot(HaveOccurred())
 			})
 		})
+		Context("with revision bump in the restoration config", func() {
+			AfterEach(func() {
+				_, err = os.Stat(tempDataDir)
+				if err == nil {
+					os.RemoveAll(tempDataDir)
+				}
+				_ = store.Delete(*compactedSnapshot)
+			})
+
+			It("should keep the revisions of the snapshots it compacts", func() {
+				restoreOpts.Config.MaxFetchers = 4
+				restoreOpts.Config.RevisionBump = 1000000000
+
+				baseSnapshot, deltaSnapList, err := miscellaneous.GetLatestFullSnapshotAndDeltaSnapList(store)
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(deltaSnapList.Len()).To(BeNumerically(">", 0))
+
+				restoreOpts.BaseSnapshot = baseSnapshot
+				restoreOpts.DeltaSnapList = deltaSnapList
+
+				compactedSnapshot, err = cptr.Compact(testCtx, compactOptions)
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(compactedSnapshot.LastRevision).To(Equal(deltaSnapList[deltaSnapList.Len()-1].LastRevision))
+			})
+		})
 		Context("with no base snapshot in backup store", func() {
 			It("should not run compaction", func() {
 				restoreOpts.Config.MaxFetchers = 4
