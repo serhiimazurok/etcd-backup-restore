@@ -18,6 +18,7 @@ import (
 
 	"github.com/gardener/etcd-backup-restore/pkg/compressor"
 	"github.com/gardener/etcd-backup-restore/pkg/etcdutil"
+	"github.com/gardener/etcd-backup-restore/pkg/etcdutil/client"
 	"github.com/gardener/etcd-backup-restore/pkg/miscellaneous"
 	mockfactory "github.com/gardener/etcd-backup-restore/pkg/mock/etcdutil/client"
 	"github.com/gardener/etcd-backup-restore/pkg/snapstore"
@@ -241,19 +242,44 @@ var _ = Describe("Running Restorer", func() {
 				Expect(err).ShouldNot(HaveOccurred())
 				Expect(revision).To(BeNumerically(">", lastRevision))
 				Expect(wr.Err()).To(MatchError(rpctypes.ErrCompacted))
+				Expect(wr.CompactRevision).To(Equal(revision))
 			})
 
-			It("should compact the embedded etcd at bumped revisions while applying delta snapshots", func() {
+			It("should compact the embedded etcd at bumped revisions while applying delta snapshots and after the last one", func() {
 				Expect(deltaSnapList.Len()).To(BeNumerically(">", 10))
+				var compactions []int64
+				restoreOpts.NewClientFactory = func(cfg brtypes.EtcdConnectionConfig, opts ...client.Option) client.Factory {
+					return compactionRecorder{Factory: etcdutil.NewFactory(cfg, opts...), revisions: &compactions}
+				}
 
 				err = restorer.RestoreAndStopEtcd(restoreOpts, nil)
 				Expect(err).ShouldNot(HaveOccurred())
 
-				revision, wr, err := getRevisionAndWatch(restoreOpts.Config.DataDir, 1)
+				revision, _, err := getRevisionAndWatch(restoreOpts.Config.DataDir, 1)
 				Expect(err).ShouldNot(HaveOccurred())
 				offset := revision - deltaSnapList[deltaSnapList.Len()-1].LastRevision
-				Expect(wr.CompactRevision).To(BeNumerically(">=", deltaSnapList[9].LastRevision+offset))
+				Expect(compactions).To(ContainElement(deltaSnapList[9].LastRevision + offset))
+				Expect(compactions[len(compactions)-1]).To(Equal(revision))
 			})
+
+			DescribeTable("should compact every revision it replays when they exceed the bump",
+				func(deltaSnapshots int) {
+					Expect(deltaSnapList.Len()).To(BeNumerically(">=", deltaSnapshots))
+					restoreOpts.Config.RevisionBump = 3
+					restoreOpts.DeltaSnapList = deltaSnapList[:deltaSnapshots]
+
+					err = restorer.RestoreAndStopEtcd(restoreOpts, nil)
+					Expect(err).ShouldNot(HaveOccurred())
+
+					revision, wr, err := getRevisionAndWatch(restoreOpts.Config.DataDir, deltaSnapList[deltaSnapshots-1].LastRevision+1)
+					Expect(err).ShouldNot(HaveOccurred())
+					Expect(wr.Err()).To(MatchError(rpctypes.ErrCompacted))
+					Expect(wr.CompactRevision).To(Equal(revision))
+				},
+				Entry("with one delta snapshot", 1),
+				Entry("with five delta snapshots", 5),
+				Entry("with eleven delta snapshots, compacted after the tenth", 11),
+			)
 		})
 
 		Context("with revision bump turned off", func() {
@@ -263,9 +289,10 @@ var _ = Describe("Running Restorer", func() {
 				err = restorer.RestoreAndStopEtcd(restoreOpts, nil)
 				Expect(err).ShouldNot(HaveOccurred())
 
-				revision, _, err := getRevisionAndWatch(restoreOpts.Config.DataDir, 1)
+				revision, wr, err := getRevisionAndWatch(restoreOpts.Config.DataDir, 1)
 				Expect(err).ShouldNot(HaveOccurred())
 				Expect(revision).To(Equal(deltaSnapList[deltaSnapList.Len()-1].LastRevision))
+				Expect(wr.CompactRevision).To(BeNumerically("<", revision))
 			})
 		})
 	})
@@ -742,9 +769,51 @@ var _ = Describe("Running Restorer", func() {
 			})
 		})
 
-		Context("with revision bump and snapshots taken after a restore with revision bump", func() {
-			It("should restore again from those snapshots", func() {
+		Context("with revision bump and a full snapshot that holds its only delta snapshot", func() {
+			It("should restore", func() {
 				restorationConfig.RevisionBump = revisionBump
+
+				cli, err := clientv3.New(clientv3.Config{Endpoints: ep, DialTimeout: 10 * time.Second})
+				Expect(err).ShouldNot(HaveOccurred())
+				defer cli.Close()
+				var putResp *clientv3.PutResponse
+				for _, key := range []string{"/bump/a", "/bump/b", "/bump/c"} {
+					putResp, err = cli.Put(testCtx, key, key)
+					Expect(err).ShouldNot(HaveOccurred())
+				}
+				_, err = etcdutil.TakeAndSaveFullSnapshot(testCtx, cli, store, GinkgoT().TempDir(), putResp.Header.Revision-2, &compressor.CompressionConfig{}, "", false, logger)
+				Expect(err).ShouldNot(HaveOccurred())
+
+				ssrCtx, cancelSsr := context.WithTimeout(testCtx, 3*time.Second)
+				defer cancelSsr()
+				snapstoreConfig := brtypes.SnapstoreConfig{Container: snapstoreDir, Provider: "Local"}
+				err = utils.RunSnapshotter(logger, snapstoreConfig, deltaSnapshotPeriod, ep, "", "", ssrCtx.Done(), false, compressor.NewCompressorConfig())
+				Expect(err).ShouldNot(HaveOccurred())
+				etcd.Close()
+				etcd = nil
+
+				err = corruptEtcdDir()
+				Expect(err).ShouldNot(HaveOccurred())
+
+				baseSnapshot, deltaSnapList, err = miscellaneous.GetLatestFullSnapshotAndDeltaSnapList(store)
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(deltaSnapList).To(HaveLen(1))
+				Expect(deltaSnapList[0].LastRevision).To(Equal(putResp.Header.Revision))
+
+				restorer, err = NewRestorer(store, logger)
+				Expect(err).ShouldNot(HaveOccurred())
+				err = restorer.RestoreAndStopEtcd(brtypes.RestoreOptions{Config: restorationConfig, BaseSnapshot: baseSnapshot, DeltaSnapList: deltaSnapList, ClusterURLs: clusterUrlsMap, PeerURLs: peerUrls}, nil)
+				Expect(err).ShouldNot(HaveOccurred())
+
+				revision, _, err := getRevisionAndWatch(etcdDir, 1)
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(revision).To(Equal(putResp.Header.Revision + revisionBump))
+			})
+		})
+
+		DescribeTable("with revision bump and snapshots taken after a restore with revision bump",
+			func(bump int64) {
+				restorationConfig.RevisionBump = uint64(bump)
 				compressionConfig := compressor.NewCompressorConfig()
 				snapstoreConfig := brtypes.SnapstoreConfig{Container: snapstoreDir, Provider: "Local"}
 
@@ -794,7 +863,7 @@ var _ = Describe("Running Restorer", func() {
 				Expect(err).ShouldNot(HaveOccurred())
 				baseSnapshot, deltaSnapList, err = miscellaneous.GetLatestFullSnapshotAndDeltaSnapList(store)
 				Expect(err).ShouldNot(HaveOccurred())
-				Expect(baseSnapshot.LastRevision).To(BeNumerically(">", revisionBump))
+				Expect(baseSnapshot.LastRevision).To(BeNumerically(">", bump))
 				Expect(deltaSnapList.Len()).To(BeNumerically(">", 0))
 				err = restorer.RestoreAndStopEtcd(brtypes.RestoreOptions{Config: restorationConfig, BaseSnapshot: baseSnapshot, DeltaSnapList: deltaSnapList, ClusterURLs: clusterUrlsMap, PeerURLs: peerUrls}, nil)
 				Expect(err).ShouldNot(HaveOccurred())
@@ -804,9 +873,11 @@ var _ = Describe("Running Restorer", func() {
 
 				revision, _, err := getRevisionAndWatch(etcdDir, 1)
 				Expect(err).ShouldNot(HaveOccurred())
-				Expect(revision).To(Equal(deltaSnapList[deltaSnapList.Len()-1].LastRevision + revisionBump))
-			})
-		})
+				Expect(revision).To(Equal(deltaSnapList[deltaSnapList.Len()-1].LastRevision + bump))
+			},
+			Entry("should restore again from those snapshots", int64(revisionBump)),
+			Entry("should restore again from those snapshots after a bump smaller than the revisions of the first ones", int64(3)),
+		)
 	})
 
 	Describe("Handle Alarm and Make etcd lean", func() {
@@ -1439,6 +1510,27 @@ func getRevisionAndWatch(dataDir string, fromRevision int64) (int64, clientv3.Wa
 	ctx, cancel := context.WithTimeout(testCtx, 10*time.Second)
 	defer cancel()
 	return resp.Header.Revision, <-cli.Watch(ctx, "", clientv3.WithPrefix(), clientv3.WithRev(fromRevision)), nil
+}
+
+// compactionRecorder records the revisions at which the KV clients it creates compact etcd.
+type compactionRecorder struct {
+	client.Factory
+	revisions *[]int64
+}
+
+func (f compactionRecorder) NewKV() (client.KVCloser, error) {
+	kv, err := f.Factory.NewKV()
+	return compactionRecordingKV{KVCloser: kv, revisions: f.revisions}, err
+}
+
+type compactionRecordingKV struct {
+	client.KVCloser
+	revisions *[]int64
+}
+
+func (kv compactionRecordingKV) Compact(ctx context.Context, rev int64, opts ...clientv3.CompactOption) (*clientv3.CompactResponse, error) {
+	*kv.revisions = append(*kv.revisions, rev)
+	return kv.KVCloser.Compact(ctx, rev, opts...)
 }
 
 func corruptEtcdDir() error {

@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -29,6 +30,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"go.etcd.io/etcd/api/v3/mvccpb"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/etcdutl/v3/snapshot"
 	"go.uber.org/zap"
@@ -256,7 +258,7 @@ func (r *Restorer) applyDeltaSnapshots(clientFactory client.Factory, endPoints [
 
 	// no more delta snapshots available
 	if len(snapList) == 1 {
-		return nil
+		return compactBumpedRevisions(clientKV, snapList[0], revisionOffset)
 	}
 
 	var (
@@ -300,6 +302,10 @@ func (r *Restorer) applyDeltaSnapshots(clientFactory client.Factory, endPoints [
 
 	if err != nil {
 		r.logger.Errorf("Restoration failed.")
+		return err
+	}
+
+	if err := compactBumpedRevisions(clientKV, snapList[len(snapList)-1], revisionOffset); err != nil {
 		return err
 	}
 
@@ -585,6 +591,21 @@ func applyEventsToEtcd(clientKV client.KVCloser, events []brtypes.Event) error {
 	}
 	_, err := clientKV.Txn(ctx).Then(ops...).Commit()
 	return err
+}
+
+// compactBumpedRevisions compacts the embedded etcd at the last delta snapshot's revision after a restore with revision bump,
+// so that a watch from any revision before it fails as compacted.
+func compactBumpedRevisions(clientKV client.KVCloser, lastSnap *brtypes.Snapshot, revisionOffset int64) error {
+	if revisionOffset == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.TODO(), etcdCompactTimeout)
+	defer cancel()
+	// ErrCompacted means that the bump's own compaction is at this revision, as when the full snapshot holds the only delta snapshot.
+	if _, err := clientKV.Compact(ctx, lastSnap.LastRevision+revisionOffset, clientv3.WithCompactPhysical()); err != nil && !errors.Is(err, rpctypes.ErrCompacted) {
+		return fmt.Errorf("failed to compact the revisions applied from delta snapshots: %v", err)
+	}
+	return nil
 }
 
 func verifySnapshotRevision(clientKV client.KVCloser, snap *brtypes.Snapshot, revisionOffset int64) error {
