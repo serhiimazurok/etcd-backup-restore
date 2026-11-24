@@ -1500,7 +1500,6 @@ var _ = Describe("Unit testing individual functions for restorer package", func(
 
 })
 
-// corruptEtcdDir corrupts the etcd directory by deleting it
 // getRevisionAndWatch starts an etcd on the data directory and returns its revision and the first response to a watch from the given revision.
 func getRevisionAndWatch(dataDir string, fromRevision int64) (int64, clientv3.WatchResponse, error) {
 	e, err := utils.StartEmbeddedEtcd(testCtx, dataDir, logger, utils.DefaultEtcdName, embeddedEtcdPortNo)
@@ -1546,6 +1545,7 @@ func (kv compactionRecordingKV) Compact(ctx context.Context, rev int64, opts ...
 	return kv.KVCloser.Compact(ctx, rev, opts...)
 }
 
+// corruptEtcdDir corrupts the etcd directory by deleting it
 func corruptEtcdDir() error {
 	if _, err := os.Stat(etcdDir); os.IsNotExist(err) {
 		return nil
