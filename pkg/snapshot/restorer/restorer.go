@@ -635,7 +635,7 @@ func getRevisionOffset(clientKV client.KVCloser, ro brtypes.RestoreOptions) (int
 	// etcd bumps the highest key revision in the snapshot. That is below the snapshot's revision when no key
 	// is left at it, as in an empty etcd's snapshot or one an etcd before v3.5.16 compacted at a delete;
 	// the snapshot's name holds its revision then.
-	baseRevision := max(resp.Header.Revision-int64(ro.Config.RevisionBump), ro.BaseSnapshot.LastRevision) // #nosec G115 -- validated to be at most math.MaxInt64.
+	baseRevision := max(resp.Header.Revision-int64(ro.Config.RevisionBump), ro.BaseSnapshot.LastRevision) // #nosec G115 -- validated to be at most 1000000000000.
 	return resp.Header.Revision - baseRevision, nil
 }
 

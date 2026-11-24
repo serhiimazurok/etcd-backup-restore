@@ -6,7 +6,6 @@ package types
 
 import (
 	"fmt"
-	"math"
 	"net/url"
 	"path"
 	"time"
@@ -29,7 +28,9 @@ const (
 	defaultEmbeddedEtcdQuotaBytes   = 8 * 1024 * 1024 * 1024 //8Gib
 	defaultAutoCompactionMode       = "periodic"             // only 2 mode is supported: 'periodic' or 'revision'
 	defaultAutoCompactionRetention  = "30m"
-	defaultRevisionBump             = 1000000000
+	defaultRevisionBump             = minRevisionBump
+	minRevisionBump                 = 1000000000    // etcd's recommendation, a week of writes at fewer than 1500 per second
+	maxRevisionBump                 = 1000000000000 // leaves int64 room for millions of restores
 )
 
 // NewClientFactoryFunc allows to define how to create a client.Factory
@@ -106,7 +107,7 @@ func (c *RestorationConfig) AddFlags(fs *flag.FlagSet) {
 	fs.Int64Var(&c.EmbeddedEtcdQuotaBytes, "embedded-etcd-quota-bytes", c.EmbeddedEtcdQuotaBytes, "maximum backend quota for the embedded etcd used for applying delta snapshots")
 	fs.StringVar(&c.AutoCompactionMode, "auto-compaction-mode", c.AutoCompactionMode, "mode for auto-compaction: 'periodic' for duration based retention. 'revision' for revision number based retention.")
 	fs.StringVar(&c.AutoCompactionRetention, "auto-compaction-retention", c.AutoCompactionRetention, "Auto-compaction retention length.")
-	fs.Uint64Var(&c.RevisionBump, "bump-revision", c.RevisionBump, "how much to increase the latest revision after restore, marking it compacted so that clients watching etcd list again; 0 disables it")
+	fs.Uint64Var(&c.RevisionBump, "bump-revision", c.RevisionBump, fmt.Sprintf("revisions to add on restore, with every earlier revision marked compacted so that clients watching etcd list again; it has to exceed the revisions etcd wrote after the last snapshot: from %d to %d, or 0 to restore the revisions unchanged", minRevisionBump, maxRevisionBump))
 }
 
 // Validate validates the config.
@@ -129,8 +130,8 @@ func (c *RestorationConfig) Validate() error {
 	if c.AutoCompactionMode != "periodic" && c.AutoCompactionMode != "revision" {
 		return fmt.Errorf("UnSupported auto-compaction-mode")
 	}
-	if c.RevisionBump > math.MaxInt64 {
-		return fmt.Errorf("revision bump must not exceed %d", int64(math.MaxInt64))
+	if c.RevisionBump != 0 && (c.RevisionBump < minRevisionBump || c.RevisionBump > maxRevisionBump) {
+		return fmt.Errorf("revision bump must be 0 or from %d to %d", minRevisionBump, maxRevisionBump)
 	}
 	c.DataDir = path.Clean(c.DataDir)
 	c.TempSnapshotsDir = path.Clean(c.TempSnapshotsDir)

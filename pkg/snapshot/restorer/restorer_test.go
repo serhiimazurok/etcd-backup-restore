@@ -216,12 +216,25 @@ var _ = Describe("Running Restorer", func() {
 			})
 		})
 
-		Context("with revision bump above the int64 range", func() {
+		Context("with revision bump out of its range", func() {
 			It("should return error", func() {
-				restoreOpts.Config.RevisionBump = math.MaxInt64 + 1
+				for _, bump := range []uint64{1, 999999999, 1000000000001, math.MaxInt64, math.MaxInt64 + 1} {
+					restoreOpts.Config.RevisionBump = bump
 
-				err = restoreOpts.Config.Validate()
-				Expect(err).Should(HaveOccurred())
+					err = restoreOpts.Config.Validate()
+					Expect(err).Should(HaveOccurred(), "bump %d", bump)
+				}
+			})
+		})
+
+		Context("with revision bump in its range", func() {
+			It("should not return error", func() {
+				for _, bump := range []uint64{0, 1000000000, 1000000000000} {
+					restoreOpts.Config.RevisionBump = bump
+
+					err = restoreOpts.Config.Validate()
+					Expect(err).ShouldNot(HaveOccurred(), "bump %d", bump)
+				}
 			})
 		})
 
