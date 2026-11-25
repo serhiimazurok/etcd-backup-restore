@@ -279,7 +279,9 @@ var _ = Describe("Running Compactor", func() {
 				if err == nil {
 					os.RemoveAll(tempDataDir)
 				}
-				_ = store.Delete(*compactedSnapshot)
+				if compactedSnapshot != nil {
+					_ = store.Delete(*compactedSnapshot)
+				}
 			})
 
 			It("should keep the revisions of the snapshots it compacts", func() {
@@ -293,7 +295,10 @@ var _ = Describe("Running Compactor", func() {
 				restoreOpts.BaseSnapshot = baseSnapshot
 				restoreOpts.DeltaSnapList = deltaSnapList
 
-				compactedSnapshot, err = cptr.Compact(testCtx, compactOptions)
+				_, err = cptr.Compact(testCtx, compactOptions)
+				Expect(err).ShouldNot(HaveOccurred())
+
+				compactedSnapshot, _, err = miscellaneous.GetLatestFullSnapshotAndDeltaSnapList(store)
 				Expect(err).ShouldNot(HaveOccurred())
 				Expect(compactedSnapshot.LastRevision).To(Equal(deltaSnapList[deltaSnapList.Len()-1].LastRevision))
 			})
