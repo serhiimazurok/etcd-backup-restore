@@ -258,11 +258,11 @@ var _ = Describe("Running Restorer", func() {
 				Expect(wr.CompactRevision).To(Equal(revision))
 			})
 
-			It("should compact the embedded etcd at bumped revisions while applying delta snapshots and after the last one", func() {
+			It("should compact the embedded etcd at bumped revisions while applying delta snapshots and after the last one, waiting for each", func() {
 				Expect(deltaSnapList.Len()).To(BeNumerically(">", 10))
-				var compactions []int64
+				var compactions []compaction
 				restoreOpts.NewClientFactory = func(cfg brtypes.EtcdConnectionConfig, opts ...client.Option) client.Factory {
-					return compactionRecorder{Factory: etcdutil.NewFactory(cfg, opts...), revisions: &compactions}
+					return compactionRecorder{Factory: etcdutil.NewFactory(cfg, opts...), compactions: &compactions}
 				}
 
 				err = restorer.RestoreAndStopEtcd(restoreOpts, nil)
@@ -271,8 +271,8 @@ var _ = Describe("Running Restorer", func() {
 				revision, _, err := getRevisionAndWatch(restoreOpts.Config.DataDir, 1)
 				Expect(err).ShouldNot(HaveOccurred())
 				offset := revision - deltaSnapList[deltaSnapList.Len()-1].LastRevision
-				Expect(compactions).To(ContainElement(deltaSnapList[9].LastRevision + offset))
-				Expect(compactions[len(compactions)-1]).To(Equal(revision))
+				Expect(compactions).To(ContainElement(compaction{op: clientv3.OpCompact(deltaSnapList[9].LastRevision+offset, clientv3.WithCompactPhysical())}))
+				Expect(compactions[len(compactions)-1]).To(Equal(compaction{op: clientv3.OpCompact(revision, clientv3.WithCompactPhysical())}))
 			})
 
 			DescribeTable("should compact every revision it replays when they exceed the bump",
@@ -1524,24 +1524,30 @@ func getRevisionAndWatch(dataDir string, fromRevision int64) (int64, clientv3.Wa
 	return resp.Header.Revision, <-cli.Watch(ctx, "", clientv3.WithPrefix(), clientv3.WithRev(fromRevision)), nil
 }
 
-// compactionRecorder records the revisions at which the KV clients it creates compact etcd.
+// compactionRecorder records the compactions that the KV clients it creates ask etcd for.
 type compactionRecorder struct {
 	client.Factory
-	revisions *[]int64
+	compactions *[]compaction
+}
+
+type compaction struct {
+	op           clientv3.CompactOp
+	withDeadline bool
 }
 
 func (f compactionRecorder) NewKV() (client.KVCloser, error) {
 	kv, err := f.Factory.NewKV()
-	return compactionRecordingKV{KVCloser: kv, revisions: f.revisions}, err
+	return compactionRecordingKV{KVCloser: kv, compactions: f.compactions}, err
 }
 
 type compactionRecordingKV struct {
 	client.KVCloser
-	revisions *[]int64
+	compactions *[]compaction
 }
 
 func (kv compactionRecordingKV) Compact(ctx context.Context, rev int64, opts ...clientv3.CompactOption) (*clientv3.CompactResponse, error) {
-	*kv.revisions = append(*kv.revisions, rev)
+	_, withDeadline := ctx.Deadline()
+	*kv.compactions = append(*kv.compactions, compaction{op: clientv3.OpCompact(rev, opts...), withDeadline: withDeadline})
 	return kv.KVCloser.Compact(ctx, rev, opts...)
 }
 

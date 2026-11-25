@@ -38,7 +38,6 @@ import (
 
 const (
 	etcdConnectionTimeout                                 = 30 * time.Second
-	etcdCompactTimeout                                    = 2 * time.Minute
 	etcdDefragTimeout                                     = 5 * time.Minute
 	periodicallyMakeEtcdLeanDeltaSnapshotInterval         = 10
 	thresholdPercentageForDBSizeAlarm             float64 = 80.0 / 100.0
@@ -599,10 +598,9 @@ func compactBumpedRevisions(clientKV client.KVCloser, lastSnap *brtypes.Snapshot
 	if revisionOffset == 0 {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.TODO(), etcdCompactTimeout)
-	defer cancel()
+	// No deadline: etcd's handler waits for the compaction even after the client gives up, and closing etcd under it crashes the process.
 	// ErrCompacted means that the bump's own compaction is at this revision, as when the full snapshot holds the only delta snapshot.
-	if _, err := clientKV.Compact(ctx, lastSnap.LastRevision+revisionOffset, clientv3.WithCompactPhysical()); err != nil && !errors.Is(err, rpctypes.ErrCompacted) {
+	if _, err := clientKV.Compact(context.TODO(), lastSnap.LastRevision+revisionOffset, clientv3.WithCompactPhysical()); err != nil && !errors.Is(err, rpctypes.ErrCompacted) {
 		return fmt.Errorf("failed to compact the revisions applied from delta snapshots: %v", err)
 	}
 	return nil
@@ -761,14 +759,13 @@ func (r *Restorer) HandleAlarm(stopHandleAlarmCh chan bool, dbSizeAlarmCh <-chan
 // MakeEtcdLeanAndCheckAlarm calls etcd compaction on given revision number and raise db size alarm if embedded etcd db size crosses threshold.
 func (r *Restorer) MakeEtcdLeanAndCheckAlarm(revision int64, endPoints []string, embeddedEtcdQuotaBytes float64, dbSizeAlarmCh chan string, dbSizeAlarmDisarmCh <-chan bool, clientKV client.KVCloser, clientMaintenance client.MaintenanceCloser) error {
 
-	ctx, cancel := context.WithTimeout(context.Background(), etcdCompactTimeout)
-	defer cancel()
-	if _, err := clientKV.Compact(ctx, revision, clientv3.WithCompactPhysical()); err != nil {
+	// No deadline, as in compactBumpedRevisions.
+	if _, err := clientKV.Compact(context.Background(), revision, clientv3.WithCompactPhysical()); err != nil {
 		return fmt.Errorf("compact API call failed: %w", err)
 	}
 	r.logger.Infof("Successfully compacted embedded etcd till revision: %v", revision)
 
-	ctx, cancel = context.WithTimeout(context.Background(), etcdConnectionTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), etcdConnectionTimeout)
 	defer cancel()
 
 	// check database size of embedded etcdServer.
