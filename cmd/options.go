@@ -150,6 +150,8 @@ func newCompactOptions() *compactOptions {
 // AddFlags adds the flags to flagset.
 func (c *compactOptions) addFlags(fs *flag.FlagSet) {
 	c.restorationConfig.AddFlags(fs)
+	// The compactor never bumps the revision.
+	_ = fs.MarkHidden("bump-revision")
 	c.snapstoreConfig.AddFlags(fs)
 	c.compactorConfig.AddFlags(fs)
 }

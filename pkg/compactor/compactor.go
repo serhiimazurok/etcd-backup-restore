@@ -59,6 +59,8 @@ func (cp *Compactor) Compact(ctx context.Context, opts *brtypes.CompactOptions) 
 
 	// Deepcopy restoration options ro to avoid any mutation of the passing object
 	compactorRestoreOptions := (opts.RestoreOptions).DeepCopy()
+	// The delta snapshots taken after the compacted snapshot continue its revisions, so the compactor never bumps them.
+	compactorRestoreOptions.Config.RevisionBump = 0
 
 	// If no base snapshot is found, abort compaction as there would be nothing to compact
 	if compactorRestoreOptions.BaseSnapshot == nil {
