@@ -272,6 +272,9 @@ func StartEmbeddedEtcd(logger *logrus.Entry, ro *brtypes.RestoreOptions) (*Embed
 	cfg.MaxTxnOps = ro.Config.MaxTxnOps
 	cfg.AutoCompactionMode = ro.Config.AutoCompactionMode
 	cfg.AutoCompactionRetention = ro.Config.AutoCompactionRetention
+	// It serves no clients, so it compacts in larger batches and with shorter pauses than etcd's defaults of 1000 and 10ms.
+	cfg.ExperimentalCompactionBatchLimit = 10000
+	cfg.ExperimentalCompactionSleepInterval = time.Millisecond
 	cfg.UnsafeNoFsync = true
 	cfg.Logger = "zap"
 	e, err := embed.StartEtcd(cfg)
