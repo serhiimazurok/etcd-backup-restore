@@ -275,6 +275,16 @@ var _ = Describe("Running Restorer", func() {
 				Expect(compactions[len(compactions)-1]).To(Equal(compaction{op: clientv3.OpCompact(revision, clientv3.WithCompactPhysical())}))
 			})
 
+			It("should fail when it cannot compact the embedded etcd after the last delta snapshot", func() {
+				var compactions []compaction
+				restoreOpts.NewClientFactory = func(cfg brtypes.EtcdConnectionConfig, opts ...client.Option) client.Factory {
+					return compactionRecorder{Factory: etcdutil.NewFactory(cfg, opts...), compactions: &compactions, err: fmt.Errorf("dummy compact etcd error")}
+				}
+
+				err = restorer.RestoreAndStopEtcd(restoreOpts, nil)
+				Expect(err).To(MatchError(ContainSubstring("dummy compact etcd error")))
+			})
+
 			DescribeTable("should compact every revision it replays when they exceed the bump",
 				func(deltaSnapshots int) {
 					Expect(deltaSnapList.Len()).To(BeNumerically(">=", deltaSnapshots))
@@ -1524,10 +1534,11 @@ func getRevisionAndWatch(dataDir string, fromRevision int64) (int64, clientv3.Wa
 	return resp.Header.Revision, <-cli.Watch(ctx, "", clientv3.WithPrefix(), clientv3.WithRev(fromRevision)), nil
 }
 
-// compactionRecorder records the compactions that the KV clients it creates ask etcd for.
+// compactionRecorder records the compactions that the KV clients it creates ask etcd for, and fails them with err when it is set.
 type compactionRecorder struct {
 	client.Factory
 	compactions *[]compaction
+	err         error
 }
 
 type compaction struct {
@@ -1537,17 +1548,21 @@ type compaction struct {
 
 func (f compactionRecorder) NewKV() (client.KVCloser, error) {
 	kv, err := f.Factory.NewKV()
-	return compactionRecordingKV{KVCloser: kv, compactions: f.compactions}, err
+	return compactionRecordingKV{KVCloser: kv, compactions: f.compactions, err: f.err}, err
 }
 
 type compactionRecordingKV struct {
 	client.KVCloser
 	compactions *[]compaction
+	err         error
 }
 
 func (kv compactionRecordingKV) Compact(ctx context.Context, rev int64, opts ...clientv3.CompactOption) (*clientv3.CompactResponse, error) {
 	_, withDeadline := ctx.Deadline()
 	*kv.compactions = append(*kv.compactions, compaction{op: clientv3.OpCompact(rev, opts...), withDeadline: withDeadline})
+	if kv.err != nil {
+		return nil, kv.err
+	}
 	return kv.KVCloser.Compact(ctx, rev, opts...)
 }
 
